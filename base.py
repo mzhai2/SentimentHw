@@ -68,26 +68,24 @@ class Base(object):
 			# self.write_model_data()
 	def read_model_data(self):
 		print('Loading Model')
-		embeddingFile = os.path.join('./data/', 'embedding.params')
 		modelFile = os.path.join('./models/', '%s.%s' % (self.name, 'params'))
-		# if load_embedding:
-			# lasagne.layers.set_all_param_values(self.embedding,embedding)
 		if os.path.isfile(modelFile):
-			with open(filename, 'r') as f:
+			with open(modelFile, 'rb') as f:
 				self.start_epoch, self.best_loss, self.best_bias, self.best_f1, params = pickle.load(f)
 			self.end_epoch += self.start_epoch
 			lasagne.layers.set_all_param_values(self.model,params)
 	def write_model_data(self):
 		filename = os.path.join('./models/', '%s.%s' % (self.name, 'params'))
-		with open(filename, 'w') as f:
-			pickle.dump((self.epoch, self.best_loss, self.best_bias, self.best_f1, lasagne.layers.get_all_param_values(self.model)), f)
+		with open(filename, 'wb') as f:
+			pickle.dump((self.epoch, self.best_loss, self.best_bias, self.best_f1, lasagne.layers.get_all_param_values(self.model)), f, protocol=-1)
 
+	@staticmethod
 	def toOrigScale(array):
-		return np.around(5*array).astype(np.int32)
-	def score(pred,label):
-		prec = precision_score(toOrigScale(self.labels[1]),toOrigScale(pred))
-		rec = recall_score(toOrigScale(5*self.labels[1]),toOrigScale(pred))
-		f1 = 2*rb_prec*rb_rec/(rb_prec+rb_rec)
+		return np.around(5*np.asarray(array,dtype=np.float32)).astype(np.int32)
+	def score(self,pred,labels):
+		prec = precision_score(self.toOrigScale(labels),self.toOrigScale(pred), average='micro')
+		rec = recall_score(self.toOrigScale(labels),self.toOrigScale(pred), average='micro')
+		f1 = 2*prec*rec/(prec+rec)
 		return prec,rec,f1
 	def find_best_threshold(self,scores,test):
 		best_f1 = 0
@@ -99,12 +97,12 @@ class Base(object):
 		else:
 			for bias in np.arange(0,5,0.20):
 				pred = scores+bias
-				prec,rec,f1 = score(pred, self.labels[1])
+				prec,rec,f1 = self.score(pred, self.labels[1])
 				if f1 > best_f1:
 					best_f1 = f1
-					best_pred = pred
+					best_pred = np.copy(pred)
 					best_bias = bias
-		return best_pred.astype(np.int32,copy=False),best_bias
+		return best_pred,best_bias
 
 	def build_model(self):
 		print("Building model and compiling functions...")
@@ -156,9 +154,9 @@ class Base(object):
 		sentence_layer = lasagne.layers.InputLayer(shape=(None,MAX_LENGTH), input_var=sentences_in)
 		embedding_layer = lasagne.layers.EmbeddingLayer(sentence_layer, input_size=self.vocab_size, output_size=100, W=self.embedding)
 		
-		conv_layer =lasagne.layers.Conv1DLayer(embedding_layer,MAX_LENGTH,3,pad='same')
+		conv_layer = lasagne.layers.Conv1DLayer(embedding_layer,MAX_LENGTH,3,pad='same')
 		
-		mask_layer = lasagne.layers.InputLayer(shape=(None, MAX_LENGTH), input_var=masks_in)
+		# mask_layer = lasagne.layers.InputLayer(shape=(None, MAX_LENGTH), input_var=masks_in)
 		
 		resetgate = lasagne.layers.Gate(W_cell=None)
 		updategate = lasagne.layers.Gate(W_cell=None)
@@ -202,14 +200,12 @@ class Base(object):
 
 			macro_batch_count = self.sentences[0].shape[0] // self.macro_batch_size
 			micro_batch_count = self.macro_batch_size // self.micro_batch_size
-			print('minibatches', macro_batch_count*micro_batch_count)
 			for macro_batch_index in xrange(macro_batch_count):
 				self.set_all(0, macro_batch_index)
 				for micro_batch_index in xrange(micro_batch_count):
 					tl, tp = self.train_fn(micro_batch_index)
 					train_loss += tl
 					train_pred.extend(tp)
-					print(tl)
 			if self.sentences[0].shape[0] % self.macro_batch_size != 0:
 				idx = self.sentences[0].shape[0]%self.macro_batch_size
 				self.set_all_rest(0, idx)
@@ -225,7 +221,6 @@ class Base(object):
 					dl, dp = self.test_fn(micro_batch_index)
 					dev_loss += dl
 					dev_pred.extend(dp)
-					print(dl)
 			if self.sentences[1].shape[0] % self.macro_batch_size != 0:
 				idx = self.sentences[1].shape[0]%self.macro_batch_size
 				self.set_all_rest(1, idx)
@@ -237,10 +232,10 @@ class Base(object):
 			dev_loss/=self.sentences[1].shape[0]
 
 			dev_pred, dev_bias = self.find_best_threshold(dev_pred,False)
-			train_prec,train_rec,train_f1 = score(train_pred,self.labels[1])
-			dev_prec,dev_rec,dev_f1 = score(dev_pred,self.labels[1])
 
-			self.save_best(dev_loss, dev_bias, rb_f1)
+			train_prec,train_rec,train_f1 = self.score(train_pred,self.labels[0])
+			dev_prec,dev_rec,dev_f1 = self.score(dev_pred,self.labels[1])
+			self.save_best(dev_loss, dev_bias, dev_f1)
 			print('Epoch',self.epoch+1,'T-L:',train_loss,'T-F1:',train_f1,'D-L:',dev_loss,'D-P', dev_prec, 'D-R', dev_rec, 'D-F1',dev_f1,'Bias',dev_bias, 'Best Loss', self.best_loss, 'Best D-F1', self.best_f1)
 
 	def evaluate_model(self):
@@ -264,9 +259,11 @@ class Base(object):
 			test_pred.extend(tp)
 
 		test_loss/=self.sentences[2].shape[0]
-		test_prec,test_rec,test_f1 = score(test_pred,self.labels[2])
+		test_pred, test_bias = self.find_best_threshold(test_pred,True)
 
-		print('Test-L:',test_loss,'Test-P', rb_prec, 'Test-R', rb_rec, 'Test-F1',rb_f1, 'Bias',self.best_bias)
+		test_prec,test_rec,test_f1 = self.score(test_pred,self.labels[2])
+
+		print('Test-L:',test_loss,'Test-P', test_prec, 'Test-R', test_rec, 'Test-F1', test_f1, 'Bias',self.best_bias)
 	
 	def load_data(self):
 		sentences = []
